@@ -1,0 +1,549 @@
+#!/usr/bin/python
+# Nessus parser by Evan Teitelman
+# Version 1.3
+
+import csv
+import sys
+import os
+import re
+import socket
+from odf import *
+from odf.opendocument import *
+from odf.style import *
+from odf.number import *
+from odf.text import *
+from odf.table import *
+from odf.teletype import *
+
+# Settings
+tva_nums = True
+include_portinfo = False
+
+# Printing
+curtab = 0
+def tab():
+    global curtab
+    curtab += 1
+
+def untab():
+    global curtab
+    curtab -= 1
+    if curtab < 0:
+        curtab = 0
+
+def tabs():
+    global curtab
+    return ' ' * (curtab * 4)
+
+def newline():
+    print('')
+
+def do_print(prefix, line, end='\n'):
+    print(tabs() + prefix + line)
+
+def print_good(line, end='\n'):
+    do_print('[+] ', line, end)
+
+def print_info(line, end='\n'):
+    do_print('[-] ', line, end)
+
+def print_error(line, end='\n'):
+    do_print('[!] ', line, end)
+
+def die(line):
+    print_error(line)
+    exit(1)
+
+# CSV
+def parse_csv(filename):
+    ret = []
+    f = open(filename, 'rb')
+    reader = csv.reader(f)
+    rows = list(reader)
+    headers = rows[0]
+    for row in rows[1:]:
+        d = {}
+        for (head, val) in zip(headers, row):
+            head = head_to_id(head)
+            d[head] = val
+        ret += [d]
+    f.close()
+    return ret
+
+def head_to_id(head):
+    return head.lower().replace(' ', '_')
+
+def clean_description(desc):
+    ret = ''
+    for line in desc.split('\n'):
+        # Skip lists
+        # TODO: also skip 'Text:'
+        #if line.startswith('    ') or line.startswith('  - '):
+        #    continue
+
+        # Joins lines
+        ret += line + '\n'
+
+    ret = re.sub(r'([^\n])\n([^\n])', r'\1 \2', ret, re.M)
+
+    return ret
+
+def clean_descriptions(vulns):
+    for vuln in vulns:
+        vuln['description'] = clean_description(vuln['description'])
+    return vulns
+
+def clean_field(data):
+    ret = ''
+    for c in data:
+        if ord(c) < 128 and c != '\r':
+            ret += c
+    return ret
+
+def clean_all_fields(vulns):
+    for vuln in vulns:
+        for field in vuln:
+            vuln[field] = clean_field(vuln[field])
+    return vulns
+
+def remove_informational(vulns):
+    new_vulns = []
+    for vuln in vulns:
+        if vuln['risk'] != 'None':
+            new_vulns += [vuln]
+    removed = len(vulns) - len(new_vulns)
+    print_good('removed {0} informational'.format(removed))
+    return new_vulns
+
+def remove_unimportant(vulns):
+    to_remove = [
+        'Microsoft Windows Unquoted Service Path Enumeration',
+        '.*Shellshock.*'
+    ]
+    new_vulns = []
+    for vuln in vulns:
+        remove = False
+        for r in to_remove:
+            r = r + '$'
+            if re.match(r, vuln['name']):
+                remove = True
+
+        if remove:
+            print_info('removed ' + vuln['name'])
+        else:
+            new_vulns += [vuln]
+    removed = len(vulns) - len(new_vulns)
+    print_good('removed {0} unimportant'.format(removed))
+    return new_vulns
+
+# Combine duplicates based on descriptions
+# Adds a new key called 'hosts'.
+# Removes the 'host' key.
+def combine_duplicates(vulns):
+    new_vulns = []
+    seen_descs = []
+    for vuln in vulns:
+        desc = vuln['description']
+        if desc in seen_descs:
+            continue
+        seen_descs += [desc]
+        hosts = [vuln['host']]
+        for peek in vulns:
+            if peek['description'] == desc:
+                hosts += [peek['host']]
+        # Sort, remove duplicates
+        hosts = sorted(list(set(hosts)))
+        vuln['hosts'] = "\n".join(hosts)
+        del vuln['host']
+        new_vulns += [vuln]
+    removed = len(vulns) - len(new_vulns)
+    print_good('removed {0} duplicates'.format(removed))
+    return new_vulns
+
+# Combine name aliases
+def combine_aliases(vulns):
+    new_vulns = []
+    seen_descs = []
+    for vuln in vulns:
+        desc = vuln['description']
+        if desc in seen_descs:
+            continue
+        seen_descs += [desc]
+        hosts = [vuln['host']]
+        for peek in vulns:
+            if peek['description'] == desc:
+                hosts += [peek['host']]
+        # Sort, remove duplicates
+        hosts = sorted(list(set(hosts)))
+        vuln['hosts'] = "\n".join(hosts)
+        del vuln['host']
+        new_vulns += [vuln]
+    removed = len(vulns) - len(new_vulns)
+    print_good('removed {0} duplicates'.format(removed))
+    return new_vulns
+
+software_aliases = {
+    'Flash Player': 'Adobe Flash Player',
+    'Shockwave Player': 'Adobe Shockwave Player',
+    'Adobe Reader 9.x / 10.x': 'Adobe Reader',
+    'ESXi': 'VMware ESXi',
+    'VMware ESXi 5.5': 'VMware ESXi',
+    'ESXi 5.5': 'VMware ESXi',
+    'VMware ESX / ESXi': 'VMware ESXi',
+    'vSphere Client': 'VMware vSphere Client',
+    'Oracle Java JDK / JRE 6': 'Oracle Java JDK/JRE/SE',
+    'Oracle Java SE': 'Oracle Java JDK/JRE/SE',
+    'SigPlus Pro ActiveX': 'SigPlus Pro ActiveX Control',
+    'Apache 2.0.x': 'Apache HTTP Server',
+    'Apache': 'Apache HTTP Server',
+    'Apache 2.x': 'Apache HTTP Server',
+    'Apache 2.2.x': 'Apache HTTP Server',
+    'Apache httpd': 'Apache HTTP Server',
+    'Apache 2.4.x': 'Apache HTTP Server',
+    'OpenSSL 0.9.8': 'OpenSSL',
+    'bash-4.2.48': 'bash',
+}
+
+def parse_update(vuln):
+    name = vuln['name']
+    solution = vuln['solution']
+    match = re.compile('([^<]+)<').match(name)
+    if not match:
+        match = re.compile('(.+) Unsupported').match(name)
+    if not match:
+        match = re.compile('Fedora [0-9]{2} : (.+)-[^-]+-[^ ]+ ').match(name)
+    if not match:
+        match = re.compile('(.+?) Multiple').match(name)
+    if not match:
+        match = re.compile('^(Cisco TelePresence)').match(name)
+    if not match:
+        match = re.compile('^(VMware ESXi) Tools Guest').match(name)
+    # TODO: make more generic?
+    if not match:
+        match = re.compile('.+? Vulnerability in (Visual Studio)').match(name)
+    # TODO: make more generic?
+    if not match:
+        match = re.compile('.+? Vulnerabilities in (Visual Studio)').match(name)
+    if not match:
+        match = re.compile('.*?Cumulative Security Update for (Internet Explorer).*').match(name)
+    if not match:
+        match = re.compile('Upgrade to (.+?) ([0-9]|version|update).*', re.IGNORECASE).match(solution)
+        if match:
+            software = match.group(1)
+            first_word = software.strip().split()[0]
+
+            # Skip non-capital software names (probably 'the latest')
+            if not re.compile('.*[A-Z].*').match(first_word):
+                return None
+
+    if not match:
+        return None
+
+    software = match.group(1).strip()
+    if software in software_aliases.keys():
+        software = software_aliases[software]
+    return software
+
+# Combine Fedora updates
+def combine_fedora(vulns):
+    new_vulns = []
+
+    new_vulns = vulns # debug
+
+    return new_vulns
+
+# Combine duplicates based on updates
+def combine_updates(vulns):
+    new_vulns = []
+    seen_software = []
+    for vuln in vulns:
+        software = parse_update(vuln)
+
+        if software == None:
+            if 'update' in vuln['solution'].lower() or 'upgrade' in vuln['solution'].lower():
+                print_error('potential missed update:')
+                print_error('    name: ' + vuln['name'])
+                print_error('    solution: ' + vuln['solution'])
+            new_vulns += [vuln]
+            continue
+
+        if software in seen_software:
+            print_info('duplicate update found for {0}: {1}'.format(software, vuln['name']))
+            continue
+
+        # Skip SSL stuff because those are almost never actual updates
+        if vuln['name'].startswith('SSL/TLS'):
+            new_vulns += [vuln]
+            continue
+
+        print_info('found update for ' + software)
+        seen_software += [software]
+
+        hosts = vuln['hosts'].split("\n")
+
+        for peek in vulns:
+            peek_software = parse_update(peek)
+            if peek_software == software:
+                hosts += peek['hosts'].split("\n")
+
+        # Sort, remove duplicates
+        hosts = sorted(list(set(hosts)))
+        vuln['hosts'] = "\n".join(hosts)
+        if software == 'Microsoft Windows XP':
+            vuln['solution'] = 'Upgrade to a supported version of Microsoft Windows'
+            vuln['name'] = software + ' is no longer supported'
+            vuln['description'] = software + ' is no longer supported by Microsoft and is vulnerable to multiple public, unpatched vulnerabilities'
+        else:
+            vuln['solution'] = 'Upgrade to the latest version of ' + software + ' or remove the software if necessary'
+            vuln['name'] = software + ' is out-of-date'
+            vuln['description'] = 'The version of ' + software + ' is out-of-date and either no longer supported or affected by multiple vulnerabilities'
+        new_vulns += [vuln]
+    removed = len(vulns) - len(new_vulns)
+    print_good('removed {0} duplicate updates'.format(removed))
+    return new_vulns
+
+def sort_by_name(vulns):
+    new_vulns = sorted(vulns, key=lambda k: k['name'])
+    return new_vulns
+
+def sort_by_risk(vulns):
+    risk_order = {'Low': 4,
+                  'Medium': 3,
+                  'High': 2,
+                  'Critical': 1}
+
+    # Add risk values
+    for vuln in vulns:
+        vuln['risk_value'] = risk_order[vuln['risk']]
+
+    new_vulns = sorted(vulns, key=lambda k: k['risk_value'])
+    return new_vulns
+
+def vulns_by_risk(vulns, risk):
+    return [vuln for vuln in vulns if vuln['risk'] == risk]
+
+# Print (debug)
+def print_vulns(vulns, debug=False):
+    print_good('total vulns: ' + str(len(vulns)))
+    print_good('critical vulns: ' + str(len(vulns_by_risk(vulns, 'Critical'))))
+    print_good('high vulns: ' + str(len(vulns_by_risk(vulns, 'High'))))
+    print_good('medium vulns: ' + str(len(vulns_by_risk(vulns, 'Medium'))))
+    print_good('low vulns: ' + str(len(vulns_by_risk(vulns, 'Low'))))
+    if debug:
+        for vuln in vulns:
+            print(vuln)
+
+# Add numbers
+def add_numbers(vulns):
+    num = 1
+    for vuln in vulns:
+        if tva_nums:
+            vuln['num'] = 'TVA-' + str(num)
+        else:
+            vuln['num'] = str(num)
+        num += 1
+    return vulns
+
+def write_to_doc(vulns, docname):
+    # Begin document
+    doc = OpenDocumentText()
+
+    # Styles
+    widthwide = Style(name="Wwide", family="table-column")
+    widthwide.addElement(TableColumnProperties(columnwidth="1.5in"))
+    doc.automaticstyles.addElement(widthwide)
+
+    widthshort = Style(name="Wshort", family="table-column")
+    widthshort.addElement(TableColumnProperties(columnwidth="1.7cm"))
+    doc.automaticstyles.addElement(widthshort)
+
+    highstyle = Style(name="High Findings", family="paragraph")
+    highstyleprop = TextProperties(fontweight="bold", color="#FF2400")
+    highstyle.addElement(highstyleprop)
+    doc.automaticstyles.addElement(highstyle)
+
+    moderatestyle = Style(name="Moderate Findings", family="paragraph")
+    moderatestyleprop = TextProperties(fontweight="bold", color="#FF7F00")
+    moderatestyle.addElement(moderatestyleprop)
+    doc.automaticstyles.addElement(moderatestyle)
+
+    lowstyle = Style(name="Low Findings", family="paragraph")
+    lowstyleprop = TextProperties(fontweight="bold", color="#007FFF")
+    lowstyle.addElement(lowstyleprop)
+    doc.automaticstyles.addElement(lowstyle)
+
+    notestyle = Style(name="Note Findings", family="paragraph")
+    notestyleprop = TextProperties(fontweight="bold")
+    notestyle.addElement(notestyleprop)
+    doc.automaticstyles.addElement(notestyle)
+
+    boldstyle = Style(name="Bold", family="paragraph")
+    boldprop = TextProperties(fontweight="bold")
+    boldstyle.addElement(boldprop)
+    doc.automaticstyles.addElement(boldstyle)
+
+    criticalstyle = Style(name="Critical Findings", family="paragraph")
+    criticalstyleprop = TextProperties(fontweight="bold", color="#FF0000")
+    criticalstyle.addElement(criticalstyleprop)
+    doc.automaticstyles.addElement(criticalstyle)
+
+    tablecontents = Style(name="Table Contents", family="paragraph")
+    tablecontents.addElement(ParagraphProperties(numberlines="false", linenumber="0"))
+    doc.styles.addElement(tablecontents)
+
+    risk_styles = {'Low': lowstyle,
+                'Medium': moderatestyle,
+                'High': highstyle,
+                'Critical': criticalstyle}
+
+    risk_names = {'Low': 'Low',
+                'Medium': 'Moderate',
+                'High': 'High',
+                'Critical': 'Critical'}
+
+    # Begin table
+    table = Table()
+
+    # Make header
+    table.addElement(TableColumn(numbercolumnsrepeated=5, stylename=widthwide))
+    tr = TableRow()
+    for column in ['Number', 'Name', 'Description', 'Suggestion', 'Hosts']:
+        tc = TableCell()
+        tc.addElement(P(stylename=boldstyle, text=unicode(column, 'utf-8')))
+        tr.addElement(tc)
+    table.addElement(tr)
+
+    for vuln in vulns:
+        tr = TableRow()
+        for key in ['num', 'name', 'description', 'solution', 'hosts']:
+            style = tablecontents
+            val = vuln[key]
+            additional = None
+            # Special processing
+            if key == 'name':
+                style = boldstyle
+                if include_portinfo:
+                    port = vuln['port']
+                    if port and len(port) > 0 and port not in ['445', '0']:
+                        port_info = vuln['protocol'].upper() + '/' + str(port)
+                        try:
+                            service_type = socket.getservbyport(int(port)).upper()
+                            port_info += ' (' + service_type + ')'
+                        except:
+                            pass
+                        val += "\n" + port_info
+
+            tc = TableCell()
+            paragraph = P(stylename=style)
+            #text=unicode(val, 'utf-8'))
+            addTextToElement(paragraph, val)
+            tc.addElement(paragraph)
+
+            if key == 'description':
+                risk = vuln['risk']
+
+                text = "\nRISK RATING:"
+                paragraph = P(stylename=boldstyle)
+                addTextToElement(paragraph, text)
+                tc.addElement(paragraph)
+
+                text = risk_names[risk]
+                paragraph = P(stylename=risk_styles[risk])
+                addTextToElement(paragraph, text)
+                tc.addElement(paragraph)
+
+            tr.addElement(tc)
+        table.addElement(tr)
+
+    doc.text.addElement(table)
+    doc.save(docname)
+
+def print_syntax():
+    print('syntax: ./parse_nessus out.odt in1.csv in2.csv')
+
+def main():
+    if len(sys.argv) < 2:
+        print_syntax()
+        exit(1)
+
+    outname = sys.argv[1]
+    if not outname.endswith('.odt'):
+        die('output file does not end in .odt (probably wrong)')
+        print_syntax()
+        exit(1)
+
+    # Parse all CSV
+    vulns = []
+    for filename in sys.argv[2:]:
+        vulns += parse_csv(filename)
+
+    print_good('removing informational...')
+    tab()
+    vulns = remove_informational(vulns)
+    untab()
+    newline()
+
+    print_good('combining duplicates...')
+    tab()
+    vulns = combine_duplicates(vulns)
+    untab()
+    newline()
+
+    print_good('removing unimportant...')
+    tab()
+    vulns = remove_unimportant(vulns)
+    untab()
+    newline()
+
+    print_good('combining fedora...')
+    tab()
+    vulns = combine_fedora(vulns)
+    untab()
+    newline()
+
+    print_good('combining updates...')
+    tab()
+    vulns = combine_updates(vulns)
+    untab()
+    newline()
+
+    print_good('cleaning descriptions...')
+    tab()
+    vulns = clean_descriptions(vulns)
+    untab()
+    newline()
+
+    print_good('cleaning all fields...')
+    tab()
+    vulns = clean_all_fields(vulns)
+    untab()
+    newline()
+
+    print_good('sorting by name...')
+    tab()
+    vulns = sort_by_name(vulns)
+    untab()
+
+    print_good('sorting by risk...')
+    tab()
+    vulns = sort_by_risk(vulns)
+    untab()
+
+    print_good('adding numbers...')
+    tab()
+    vulns = add_numbers(vulns)
+    untab()
+
+    print_good('vulnerability information:')
+    tab()
+    print_vulns(vulns)
+    untab()
+    newline()
+
+    print_good('writing to document...')
+    tab()
+    write_to_doc(vulns, outname)
+    untab()
+
+if __name__ == '__main__':
+    main()
