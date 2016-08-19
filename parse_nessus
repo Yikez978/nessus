@@ -468,13 +468,18 @@ def main():
 
     outname = sys.argv[1]
     if not outname.endswith('.odt'):
-        die('output file does not end in .odt (probably wrong)')
+        print_error('output file does not end in .odt (probably wrong)')
         print_syntax()
         exit(1)
 
     # Parse all CSV
     vulns = []
     for filename in sys.argv[2:]:
+        if not filename.endswith('.csv'):
+            print_error('input file {0} does not end in .csv (probably wrong)'.format(filename))
+            print_syntax()
+            exit(1)
+
         vulns += parse_csv(filename)
 
     print_good('removing informational...')
